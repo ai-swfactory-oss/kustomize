@@ -1,0 +1,26 @@
+{
+  "name": "@ai-swfactory-oss/kustomize",
+  "description": "kustomize (kubernetes-sigs/kustomize) as the native upstream binary for your platform: no WASM, no download at install time, no install scripts",
+  "keywords": [
+    "kustomize",
+    "kubernetes",
+    "yaml",
+    "k8s"
+  ],
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "kustomize": "bin/kustomize.js"
+  },
+  "files": [
+    "bin/kustomize.js",
+    "index.js",
+    "index.d.ts",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

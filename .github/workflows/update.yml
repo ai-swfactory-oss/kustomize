@@ -1,0 +1,155 @@
+name: update
+
+# Daily: if kubernetes-sigs/kustomize has a newer non-prerelease kustomize
+# release, rewrite upstream.json for it (asset names and the sha256 digests
+# GitHub reports for them, each cross-checked against upstream's own
+# checksums.txt, repack reset to 0) and open a pull request with it; the run
+# fetches, packs and installs it on every platform, and merging it publishes
+# (build.yml runs on the push to main). Then make sure the packages for main's
+# upstream.json are published: every successful publish ends with a GitHub
+# release v<version>, so a missing release means "not published yet", and a
+# failed build is retried every day until it succeeds.
+#
+# The upstream repository also releases its Go modules (api/, kyaml/,
+# cmd/config/), so releases/latest is not necessarily kustomize: the step
+# lists releases and keeps only tags "kustomize/v<semver>".
+#
+# Monthly: keep the schedule alive. GitHub disables scheduled workflows after
+# 60 days without repository activity.
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+    - cron: "41 5 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  packages: write
+  actions: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    outputs:
+      missing: ${{ steps.check.outputs.missing }}
+      sha: ${{ steps.check.outputs.sha }}
+      bump: ${{ steps.bump.outputs.sha }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Is main's version published?
+        id: check
+        run: |
+          tag="v$(bash scripts/pkgver.sh)"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "missing=false" >> "$GITHUB_OUTPUT"; echo "$tag already released"
+          else
+            echo "missing=true" >> "$GITHUB_OUTPUT"; echo "$tag not released: building"
+          fi
+
+      - name: Keepalive (monthly)
+        if: github.event.schedule == '41 5 1 * *'
+        run: gh api -X PUT "repos/$GH_REPO/actions/workflows/update.yml/enable"
+
+      - name: Follow the latest upstream kustomize release
+        id: follow
+        run: |
+          releases=$(gh api --paginate 'repos/kubernetes-sigs/kustomize/releases?per_page=100' | jq -s 'add')
+          latest=$(jq -r '
+            [ .[] | select((.draft or .prerelease) | not)
+                  | select(.tag_name | test("^kustomize/v[0-9]+\\.[0-9]+\\.[0-9]+$"))
+                  | .tag_name | ltrimstr("kustomize/v") ]
+            | sort_by(split(".") | map(tonumber)) | last // empty' <<<"$releases")
+          if [ -z "$latest" ]; then
+            echo "no kustomize/v<semver> release found upstream" >&2; exit 1
+          fi
+          current=$(jq -er .version upstream.json)
+          newest=$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n1)
+          if [ "$latest" = "$current" ] || [ "$newest" != "$latest" ]; then
+            echo "upstream $latest, ours $current: nothing to do"; exit 0
+          fi
+          echo "upstream $latest is newer than $current: updating upstream.json"
+          release=$(jq --arg t "kustomize/v$latest" 'first(.[] | select(.tag_name == $t))' <<<"$releases")
+          jq --arg v "$latest" '
+            def asset($suffix):
+              ("kustomize_v\($v)_\($suffix).tar.gz") as $n
+              | (first($release[0].assets[] | select(.name == $n)) // error("asset \($n) missing"))
+              | if (.digest // "" | startswith("sha256:")) then {name: .name, digest: .digest}
+                else error("asset \($n) has no sha256 digest") end;
+            {
+              version: $v,
+              repack: 0,
+              assets: {
+                "linux-x64": asset("linux_amd64"),
+                "linux-arm64": asset("linux_arm64"),
+                "darwin-x64": asset("darwin_amd64"),
+                "darwin-arm64": asset("darwin_arm64")
+              }
+            }' --slurpfile release <(printf '%s' "$release") -n > upstream.json.new
+          # Cross-check: every digest must equal the one upstream publishes in
+          # its checksums.txt for the same release.
+          curl -fsSL --retry 3 -o checksums.txt \
+            "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv$latest/checksums.txt"
+          for platform in $(jq -r '.assets | keys | join(" ")' upstream.json.new); do
+            name=$(jq -er --arg p "$platform" '.assets[$p].name' upstream.json.new)
+            digest=$(jq -er --arg p "$platform" '.assets[$p].digest' upstream.json.new)
+            listed=$(awk -v n="$name" '$2 == n { print $1 }' checksums.txt)
+            if [ "sha256:$listed" != "$digest" ]; then
+              echo "$name: GitHub reports $digest, checksums.txt lists sha256:$listed" >&2; exit 1
+            fi
+          done
+          rm checksums.txt
+          mv upstream.json.new upstream.json
+          cat upstream.json
+          echo "version=$latest" >> "$GITHUB_OUTPUT"
+
+      - name: Open the bump pull request
+        id: bump
+        if: steps.follow.outputs.version != ''
+        env:
+          VERSION: ${{ steps.follow.outputs.version }}
+        run: |
+          branch="update/kustomize-$VERSION"
+          if gh pr list --head "$branch" --state open --json number --jq '.[0].number' | grep -q .; then
+            echo "pull request for $branch already open"; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "chore: update kustomize to $VERSION"
+          git push --force origin "$branch"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          gh pr create --head "$branch" --base main --title "chore: update kustomize to $VERSION" \
+            --body "kubernetes-sigs/kustomize released kustomize/v$VERSION. upstream.json now pins its release archives and the sha256 digests GitHub reports for them, each equal to upstream's checksums.txt. The update run that opened this pull request fetched, verified, packed and installed the packages on every platform (pull requests opened with GITHUB_TOKEN start no pr workflow); merging publishes them."
+
+  # A pull request opened with GITHUB_TOKEN starts no workflow, so the bump is
+  # built and tested here, on the branch the pull request carries.
+  test-bump:
+    needs: update
+    if: needs.update.outputs.bump != ''
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.update.outputs.bump }}
+      publish: false
+    secrets: inherit
+
+  build:
+    needs: update
+    if: needs.update.outputs.missing == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.update.outputs.sha }}
+      publish: true
+    secrets: inherit

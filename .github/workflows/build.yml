@@ -1,0 +1,245 @@
+name: build
+
+# Fetches the upstream kustomize release archives pinned in upstream.json
+# (sha256 verified: a mismatch fails here, before anything is extracted, staged
+# or published), extracts the binary from each, renders the npm packages, packs
+# them once, and installs the packed tarballs on every platform's runner as a
+# consumer would. When publishing, every tarball and binary gets a
+# build-provenance attestation, then the exact tested tarballs go to GitHub
+# Packages (platform packages first, the launcher last; versions that already
+# exist are skipped), then a GitHub release v<version> carries the tarballs,
+# the original upstream archives and SHA256SUMS.
+# Pull requests (this workflow called from pr.yml) build and test only.
+
+on:
+  push:
+    branches: [main]
+    paths: [upstream.json, scripts/**, packages/**, test/**, .github/workflows/build.yml]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the packages and the release
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build
+        type: string
+        required: true
+      publish:
+        description: Publish the packages and the release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  pack:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      upstream: ${{ steps.meta.outputs.upstream }}
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Metadata
+        id: meta
+        run: |
+          {
+            echo "version=$(bash scripts/pkgver.sh)"
+            echo "upstream=$(jq -er .version upstream.json)"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: "Named test: a digest mismatch fails the fetch"
+        run: bash test/digest-mismatch.sh
+
+      - name: Fetch upstream release (sha256 verified)
+        run: bash scripts/fetch.sh build/upstream
+
+      - name: Stage packages
+        run: bash scripts/stage.sh build/upstream build/npm
+
+      - name: "Named tests: the launcher's platform errors"
+        run: KUSTOMIZE_LAUNCHER_DIR="$PWD/build/npm/kustomize" node --test test/launcher.test.js
+
+      - name: Pack
+        run: |
+          mkdir -p dist/tgz
+          for dir in build/npm/*/; do
+            npm pack "./$dir" --pack-destination dist/tgz
+          done
+          ls -l dist/tgz
+          for f in dist/tgz/*.tgz; do
+            echo "== $f"; tar -tvzf "$f"
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm
+          path: dist/tgz/*.tgz
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: upstream
+          path: build/upstream/assets/*
+          if-no-files-found: error
+
+  test:
+    needs: pack
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux-x64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+          - runner: macos-latest
+            platform: darwin-arm64
+          - runner: macos-15-intel
+            platform: darwin-x64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm
+          path: dist/tgz
+
+      - name: "Named test: install the packed tarballs; binaryPath(), version and build"
+        run: bash scripts/smoke.sh dist/tgz ${{ matrix.platform }}
+
+  publish:
+    needs: [pack, test]
+    if: github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.pack.outputs.version }}
+      UPSTREAM: ${{ needs.pack.outputs.upstream }}
+      SHA: ${{ needs.pack.outputs.sha }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.pack.outputs.sha }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://npm.pkg.github.com
+          scope: "@ai-swfactory-oss"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm
+          path: dist/tgz
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: upstream
+          path: dist/upstream
+
+      - name: Extract the binaries to attest
+        run: |
+          mkdir -p dist/bin
+          for platform in $(jq -r '.assets | keys | join(" ")' upstream.json); do
+            tar -xzOf "dist/tgz/ai-swfactory-oss-kustomize-$platform-$VERSION.tgz" \
+              "package/bin/kustomize" > "dist/bin/kustomize-$platform"
+            test -s "dist/bin/kustomize-$platform"
+          done
+          ls -l dist/bin
+          sha256sum dist/bin/*
+
+      # Build provenance (SLSA, signed through Sigstore, stored by GitHub) for
+      # every npm tarball and every kustomize binary this run publishes. The
+      # binaries are upstream's, byte for byte (the archive's sha256 pinned in
+      # upstream.json); the attestation records which workflow run, commit and
+      # repository packaged them. Consumers check with `gh attestation verify`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/tgz/*.tgz
+            dist/bin/kustomize-*
+
+      - name: Publish to GitHub Packages (platforms first, launcher last)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          publish() {
+            local name=$1 file
+            file="dist/tgz/$(echo "${name#@}" | tr / -)-$VERSION.tgz"
+            if [ "$(npm view "$name@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+              echo "$name@$VERSION already published: skipping"
+              return
+            fi
+            # Explicit dist-tag: a -r.N re-pack is a semver prerelease and must
+            # still become latest.
+            npm publish "$file" --tag latest
+          }
+          for platform in $(jq -r '.assets | keys | join(" ")' upstream.json); do
+            publish "@ai-swfactory-oss/kustomize-$platform"
+          done
+          publish "@ai-swfactory-oss/kustomize"
+
+      - name: Create GitHub release v${{ needs.pack.outputs.version }}
+        run: |
+          tag="v$VERSION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists: skipping"
+            exit 0
+          fi
+          mkdir -p dist/release
+          cp dist/tgz/*.tgz dist/upstream/* dist/release/
+          (cd dist/release && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          {
+            echo "kustomize v$UPSTREAM as npm packages on GitHub Packages, package version \`$VERSION\`."
+            echo
+            echo '```sh'
+            echo "npm install --save-dev @ai-swfactory-oss/kustomize@$VERSION"
+            echo '```'
+            echo
+            echo "Packages:"
+            echo "- \`@ai-swfactory-oss/kustomize@$VERSION\` (launcher: \`kustomize\` bin, \`binaryPath()\` and \`upstreamVersion\`)"
+            for platform in $(jq -r '.assets | keys | join(" ")' upstream.json); do
+              echo "- \`@ai-swfactory-oss/kustomize-$platform@$VERSION\`: from upstream \`$(jq -r --arg p "$platform" '.assets[$p].name' upstream.json)\`, \`$(jq -r --arg p "$platform" '.assets[$p].digest' upstream.json)\`"
+            done
+            echo
+            echo "Upstream release: https://github.com/kubernetes-sigs/kustomize/releases/tag/kustomize%2Fv$UPSTREAM"
+            echo
+            echo "License: Apache-2.0, the license of kustomize."
+            echo
+            echo "Assets: the npm tarballs as published, the original upstream archives, and \`SHA256SUMS\` over all of them."
+          } > dist/notes.md
+          gh release create "$tag" dist/release/* --target "$SHA" --title "$tag" --notes-file dist/notes.md --latest
